@@ -1483,16 +1483,169 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
 <div id="toast">OK</div>
 
 <script>
-// ══════════════════════════
-//  STATE
-// ══════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  SMARTREMOTE PRO — CLIENT-SIDE ENGINE
+//  En Vercel (serverless) el servidor no puede tocar la LAN.
+//  El browser SÍ está en la misma red que el TV → fetch directo.
+// ═══════════════════════════════════════════════════════════
+
+// ── STATE ──
 let selDev = null, devices = [], editMode = false;
 let sizes = JSON.parse(localStorage.getItem('btnSizes_v4')||'{}');
 let pendingPairIp = '', pendingPairBrand = '';
 
-// ══════════════════════════
-//  BOTONES — click + resize
-// ══════════════════════════
+// ── DETECCIÓN IP LOCAL VÍA WebRTC ──
+function getLocalIP(){
+  return new Promise(resolve=>{
+    try{
+      const pc=new RTCPeerConnection({iceServers:[]});
+      pc.createDataChannel('');
+      pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>resolve(null));
+      pc.onicecandidate=e=>{
+        if(!e||!e.candidate)return;
+        const m=e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
+        if(m&&!m[1].startsWith('127.')&&!m[1].startsWith('169.')){resolve(m[1]);pc.close();}
+      };
+      setTimeout(()=>resolve(null),3500);
+    }catch(ex){resolve(null);}
+  });
+}
+
+// ── PROBE PUERTO (browser → TV directo) ──
+// Con mode:'no-cors' el browser SÍ hace la petición;
+// si AbortError → timeout = nadie; TypeError (CORS) → ¡hay algo!
+async function probePort(ip, port, ms=700){
+  const ctrl=new AbortController();
+  const tid=setTimeout(()=>ctrl.abort(), ms);
+  try{
+    await fetch(`http://${ip}:${port}/`, {signal:ctrl.signal, mode:'no-cors', cache:'no-store'});
+    clearTimeout(tid); return true;
+  }catch(e){
+    clearTimeout(tid);
+    return e.name!=='AbortError';
+  }
+}
+
+// ── IDENTIFICAR MARCA POR PUERTOS ──
+function guessBrand(ports){
+  if(ports.some(p=>[8001,8002,55000].includes(p))) return {brand:'samsung',type:'samsung_tv',label:'Samsung Smart TV'};
+  if(ports.some(p=>[3000,1780,1779].includes(p)))  return {brand:'lg',type:'lg_tv',label:'LG Smart TV (webOS)'};
+  if(ports.some(p=>[8060,8061].includes(p)))        return {brand:'roku',type:'roku',label:'Roku / TCL'};
+  if(ports.includes(1925))                          return {brand:'philips',type:'philips_tv',label:'Philips Android TV'};
+  if(ports.includes(36669))                         return {brand:'hisense',type:'hisense_tv',label:'Hisense Smart TV'};
+  if(ports.some(p=>[8008,8009].includes(p)))        return {brand:'chromecast',type:'chromecast',label:'Google Chromecast'};
+  return {brand:'android',type:'android_tv',label:'Smart TV / Android TV'};
+}
+
+const TV_PORTS=[8001,8002,8060,8061,3000,1780,1925,36669,8008,8080,80,55000];
+
+// ── ESCANEO CLIENTE (browser recorre la subred) ──
+let scanRunning=false;
+async function clientScan(subnet, onFound, onProgress){
+  const BATCH=25;
+  let done=0;
+  async function checkIP(i){
+    const ip=`${subnet}.${i}`;
+    for(const port of TV_PORTS){
+      if(await probePort(ip, port, 650)){
+        const info=guessBrand([port]);
+        onFound({ip, openPorts:[port], ...info,
+          name:`${info.label} (${ip})`, paired:false,
+          source:'scan_client', model:'', manufacturer:'', last_seen:Date.now()});
+        break;
+      }
+    }
+    onProgress(Math.min(99, Math.round((++done/254)*100)));
+  }
+  const all=[]; for(let i=1;i<=254;i++) all.push(i);
+  for(let i=0;i<all.length;i+=BATCH){
+    if(!scanRunning) break;
+    await Promise.all(all.slice(i,i+BATCH).map(checkIP));
+  }
+}
+
+// ── ENVÍO DIRECTO AL TV (browser → TV, sin pasar por Vercel) ──
+async function sendDirectToTV(dev, cmd){
+  const ip=dev.ip, brand=dev.brand||'unknown';
+
+  if(brand==='samsung'||dev.openPorts?.some(p=>[8001,8002].includes(p))){
+    const KM={power:'KEY_POWER',vol_up:'KEY_VOLUP',vol_down:'KEY_VOLDOWN',mute:'KEY_MUTE',
+      ch_up:'KEY_CHUP',ch_down:'KEY_CHDOWN',up:'KEY_UP',down:'KEY_DOWN',left:'KEY_LEFT',
+      right:'KEY_RIGHT',ok:'KEY_ENTER',back:'KEY_RETURN',home:'KEY_HOME',menu:'KEY_MENU',
+      play:'KEY_PLAY',pause:'KEY_PAUSE',stop:'KEY_STOP',fwd:'KEY_FF',rewind:'KEY_REWIND',
+      prev:'KEY_REWIND',next:'KEY_FF',red:'KEY_RED',green:'KEY_GREEN',yellow:'KEY_YELLOW',
+      blue:'KEY_CYAN',info:'KEY_INFO',input:'KEY_SOURCE',apps:'KEY_CONTENTS_HOME',
+      '0':'KEY_0','1':'KEY_1','2':'KEY_2','3':'KEY_3','4':'KEY_4',
+      '5':'KEY_5','6':'KEY_6','7':'KEY_7','8':'KEY_8','9':'KEY_9'};
+    const key=KM[cmd]||`KEY_${cmd.toUpperCase()}`;
+    for(const port of [8001,8002]){
+      try{
+        await fetch(`http://${ip}:${port}/api/v2/channels/samsung.remote.control`,{
+          method:'POST', mode:'no-cors',
+          body:JSON.stringify({method:'ms.remote.control',
+            params:{Cmd:'Click',DataOfCmd:key,Option:'false',TypeOfRemote:'SendRemoteKey'}})});
+        addLog(`✓ Samsung :${port} [${key}]`,'ok'); return true;
+      }catch(e){}
+    }
+  }
+
+  if(brand==='roku'||dev.openPorts?.some(p=>[8060,8061].includes(p))){
+    const KM={power:'PowerToggle',vol_up:'VolumeUp',vol_down:'VolumeDown',mute:'VolumeMute',
+      up:'Up',down:'Down',left:'Left',right:'Right',ok:'Select',back:'Back',home:'Home',
+      play:'Play',fwd:'Fwd',rewind:'Rev',info:'Info',prev:'InstantReplay',
+      '0':'Lit_0','1':'Lit_1','2':'Lit_2','3':'Lit_3','4':'Lit_4',
+      '5':'Lit_5','6':'Lit_6','7':'Lit_7','8':'Lit_8','9':'Lit_9'};
+    const key=KM[cmd]||cmd;
+    for(const port of [8060,8061]){
+      try{
+        await fetch(`http://${ip}:${port}/keypress/${key}`,{method:'POST',mode:'no-cors'});
+        addLog(`✓ Roku :${port} [${key}]`,'ok'); return true;
+      }catch(e){}
+    }
+  }
+
+  if(brand==='lg'||dev.openPorts?.some(p=>[3000,1780].includes(p))){
+    const KM={power:'POWER',vol_up:'VOLUMEUP',vol_down:'VOLUMEDOWN',mute:'MUTE',
+      up:'UP',down:'DOWN',left:'LEFT',right:'RIGHT',ok:'ENTER',back:'BACK',home:'HOME',
+      menu:'MENU',play:'PLAY',pause:'PAUSE',stop:'STOP',fwd:'FASTFORWARD',rewind:'REWIND',
+      '0':'0','1':'1','2':'2','3':'3','4':'4','5':'5','6':'6','7':'7','8':'8','9':'9'};
+    const key=KM[cmd]||cmd.toUpperCase();
+    for(const port of [3000,1780]){
+      try{
+        await fetch(`http://${ip}:${port}/udap/api/command`,{method:'POST',mode:'no-cors',
+          body:`<?xml version="1.0" encoding="utf-8"?><envelope><api type="command"><n>HandleKeyInput</n><value>${key}</value></api></envelope>`});
+        addLog(`✓ LG UDAP :${port} [${key}]`,'ok'); return true;
+      }catch(e){}
+    }
+  }
+
+  if(brand==='philips'||dev.openPorts?.includes(1925)){
+    const KM={power:'Standby',vol_up:'VolumeUp',vol_down:'VolumeDown',mute:'Mute',
+      up:'CursorUp',down:'CursorDown',left:'CursorLeft',right:'CursorRight',
+      ok:'Confirm',back:'Back',home:'Home',play:'Play',pause:'Pause',stop:'Stop'};
+    try{
+      await fetch(`http://${ip}:1925/6/input/key`,{method:'POST',mode:'no-cors',
+        body:JSON.stringify({key:KM[cmd]||cmd})});
+      addLog('✓ Philips JointSpace','ok'); return true;
+    }catch(e){}
+  }
+
+  if(brand==='hisense'||dev.openPorts?.includes(36669)){
+    const KM={power:'KEY_POWER',vol_up:'KEY_VOLUMEUP',vol_down:'KEY_VOLUMEDOWN',mute:'KEY_MUTE',
+      up:'KEY_UP',down:'KEY_DOWN',left:'KEY_LEFT',right:'KEY_RIGHT',ok:'KEY_OK',back:'KEY_BACK'};
+    try{
+      await fetch(`http://${ip}:36669/sendremote`,{method:'POST',mode:'no-cors',
+        body:JSON.stringify({keyCode:KM[cmd]||`KEY_${cmd.toUpperCase()}`})});
+      addLog('✓ Hisense HTTP','ok'); return true;
+    }catch(e){}
+  }
+
+  // Con no-cors no sabemos si falló; asumir enviado
+  addLog(`Cmd ${cmd} enviado (no-cors)`,'');
+  return true;
+}
+
+// ── BOTONES — click + resize ──
 function applyAllSizes() {
   document.querySelectorAll('.rb[data-key]').forEach(el => {
     const k = el.dataset.key;
@@ -1503,13 +1656,10 @@ function applyAllSizes() {
 let resizeEl = null, resizeStartY = 0, resizeStartSize = 0;
 
 document.querySelectorAll('.rb[data-cmd]').forEach(el => {
-  // TAP normal → comando
   el.addEventListener('click', e => {
     if (editMode) return;
     send(el.dataset.cmd);
   });
-
-  // Pointer para resize en modo edición
   el.addEventListener('pointerdown', e => {
     if (!editMode) return;
     resizeEl = el;
@@ -1559,21 +1709,36 @@ function toggleEdit() {
   }
 }
 
-// ══════════════════════════
-//  DISPOSITIVOS
-// ══════════════════════════
-async function loadNet() {
-  try{const r=await fetch('/api/network_info');const d=await r.json();
-    document.getElementById('wifiLbl').textContent=d.local_ip||'WiFi OK';}catch(e){}
+// ── DISPOSITIVOS — ahora 100% client-side + localStorage ──
+const STORED_KEY = 'smartremote_devices_v4';
+
+function storedDevices(){
+  try{ return JSON.parse(localStorage.getItem(STORED_KEY)||'[]'); }catch(e){ return []; }
+}
+function saveDevices(devs){
+  localStorage.setItem(STORED_KEY, JSON.stringify(devs));
 }
 
-async function loadDevices() {
-  try{
-    const r=await fetch('/api/devices');const d=await r.json();
-    devices=d.devices; renderDevices(); updateWifi();
-    const saved=localStorage.getItem('lastDev');
-    if(saved&&!selDev){const f=devices.find(d=>d.ip===saved);if(f)selectDev(f,false);}
-  }catch(e){}
+function loadNet(){
+  // Mostrar IP local vía WebRTC
+  getLocalIP().then(ip=>{
+    if(ip){
+      document.getElementById('wifiLbl').textContent = ip;
+      const subnet = ip.split('.').slice(0,3).join('.');
+      document.getElementById('wifiLbl').dataset.subnet = subnet;
+    }
+  });
+}
+
+function loadDevices(){
+  devices = storedDevices();
+  renderDevices();
+  updateWifi();
+  const saved = localStorage.getItem('lastDev');
+  if(saved && !selDev){
+    const f = devices.find(d=>d.ip===saved);
+    if(f) selectDev(f, false);
+  }
 }
 
 const TYPE_LABELS={samsung_tv:'SAMSUNG TV',lg_tv:'LG WEBOS',sony_tv:'SONY BRAVIA',
@@ -1583,172 +1748,166 @@ const TYPE_LABELS={samsung_tv:'SAMSUNG TV',lg_tv:'LG WEBOS',sony_tv:'SONY BRAVIA
 function renderDevices() {
   const list=document.getElementById('devList');
   if(!devices.length){
-    list.innerHTML=`<div class="no-dev"><div class="spinner"></div>Buscando Smart TVs...<br>
-      <small style="color:#2a4060;">SSDP · UPnP · Subnet Scan</small></div>`;
+    list.innerHTML=`<div class="no-dev"><div class="spinner" style="display:none"></div>
+      Sin dispositivos.<br><small style="color:#2a4060;">Usa ESCANEAR o ingresa la IP de tu TV</small></div>`;
     return;
   }
-  list.innerHTML=devices.map(d=>{
-    const paired=d.paired;
+  list.innerHTML=devices.map((d,idx)=>{
     const sel=selDev?.ip===d.ip;
     return `<div class="dcard ${sel?'sel':''}">
       <div class="dcard-name">${d.name}</div>
       <div class="dcard-ip">${d.ip}</div>
       <div class="dcard-type">${TYPE_LABELS[d.type]||d.type}${d.model?' · '+d.model:''}</div>
-      <div class="dcard-badge ${paired?'paired':'unpaired'}">${paired?'● EMPAREJADO':'○ SIN EMPAREJAR'}</div>
+      <div class="dcard-badge ${d.paired?'paired':'unpaired'}">${d.paired?'● EMPAREJADO':'○ SIN EMPAREJAR'}</div>
       <div class="dcard-actions">
-        <button class="dcard-btn connect" onclick='connectDev(${JSON.stringify(d)})'>CONECTAR</button>
-        <button class="dcard-btn" onclick='selectDev(${JSON.stringify(d)},true)'>USAR</button>
+        <button class="dcard-btn connect" onclick='selectDev(${JSON.stringify(d)},true)'>✓ USAR</button>
+        <button class="dcard-btn" style="color:var(--accent3)" onclick='removeDev(${idx})'>✕</button>
       </div>
     </div>`;
   }).join('');
 }
 
+function removeDev(idx){
+  devices.splice(idx,1);
+  saveDevices(devices);
+  renderDevices();
+  showToast('Dispositivo eliminado');
+}
+
 function updateWifi(){
   const dot=document.getElementById('wifiDot'),lbl=document.getElementById('wifiLbl');
-  if(selDev){dot.style.background='var(--accent2)';lbl.textContent=selDev.name;}
+  if(selDev){dot.style.background='var(--accent2)';lbl.textContent=selDev.name.substring(0,18);}
   else if(devices.length>0){dot.style.background='var(--accent2)';lbl.textContent=devices.length+' TV(s)';}
-  else{dot.style.background='var(--accent3)';lbl.textContent='Buscando...';}
+  else{dot.style.background='var(--accent3)';lbl.textContent='Sin TV';}
 }
 
 function selectDev(dev, close=true) {
-  if(typeof dev==='string')dev=JSON.parse(dev);
+  if(typeof dev==='string') dev=JSON.parse(dev);
   selDev=dev;
-  renderDevices();updateWifi();
-  updateStatus(dev.name,true);
+  renderDevices(); updateWifi();
+  updateStatus(dev.name, true);
   document.getElementById('sigTxt').textContent='◈◈◈◈';
   addLog(`Usando: ${dev.name} (${dev.ip})`,'ok');
   showToast(`📡 ${dev.name}`);
-  localStorage.setItem('lastDev',dev.ip);
+  localStorage.setItem('lastDev', dev.ip);
   if(close) closeAll();
 }
 
-async function connectDev(dev) {
-  if(typeof dev==='string')dev=JSON.parse(dev);
-  addLog(`Emparejando ${dev.name}...`,'cmd');
-  showToast('🔗 CONECTANDO...');
-  try{
-    const r=await fetch('/api/pair',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ip:dev.ip,brand:dev.brand||'unknown'})});
-    const d=await r.json();
-    if(d.ok){
-      if(d.needs_pin){
-        pendingPairIp=dev.ip; pendingPairBrand=dev.brand||'';
-        document.getElementById('pinMsg').textContent=d.message||'Ingresa el PIN de tu TV';
-        document.getElementById('pinInput').value='';
-        document.getElementById('pinModal').classList.add('show');
-      } else {
-        addLog(`✓ Emparejado: ${dev.name} [${d.method}]`,'ok');
-        showToast(`✓ ${dev.name}`);
-        selectDev(dev,true);
-        loadDevices();
-      }
-    } else {
-      addLog(`✗ No se pudo emparejar ${dev.ip}`,'err');
-      showToast('⚠ Sin respuesta — intenta USAR directamente');
-      // De todas formas permitir usar
-      selectDev(dev,false);
-    }
-  }catch(e){
-    addLog('✗ Error de red','err');
-    selectDev(dev,false);
-  }
+function addFoundDev(dev){
+  const existing = devices.findIndex(d=>d.ip===dev.ip);
+  if(existing>=0) devices[existing]=dev;
+  else devices.push(dev);
+  saveDevices(devices);
+  renderDevices();
 }
 
-async function submitPin() {
-  const pin=document.getElementById('pinInput').value.trim();
-  if(!pin){showToast('⚠ Ingresa el PIN');return;}
-  try{
-    const r=await fetch('/api/submit_pin',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ip:pendingPairIp,pin})});
-    const d=await r.json();
-    closePinModal();
-    if(d.ok){
-      addLog(`✓ PIN aceptado`,'ok');showToast('✓ EMPAREJADO');
-      loadDevices();
-    } else {addLog('✗ PIN incorrecto','err');showToast('✗ PIN incorrecto');}
-  }catch(e){closePinModal();addLog('✗ Error','err');}
-}
-function closePinModal(){document.getElementById('pinModal').classList.remove('show');}
-
+// ── ESCANEO WiFi — CLIENT SIDE ──
 async function scanNow(){
   const btn=document.getElementById('scanBtn');
-  btn.classList.add('spin');btn.textContent='⟳ ESCANEANDO SSDP...';
-  addLog('Iniciando SSDP + subnet scan...','cmd');
-  try{await fetch('/api/scan',{method:'POST'});}catch(e){}
-  // Recargar en ciclos cortos para mostrar resultados progresivos
-  let waited=0;
-  const iv=setInterval(async()=>{
-    waited+=2000;
-    await loadDevices();
-    if(waited>=10000){
-      clearInterval(iv);
-      btn.classList.remove('spin');btn.textContent='⟳ ESCANEAR RED (SSDP)';
-      addLog(`Encontrados: ${devices.length} disp.`,devices.length?'ok':'');
+  btn.classList.add('spin'); btn.textContent='⟳ DETECTANDO IP...';
+  addLog('Obteniendo IP local...','cmd');
+
+  let subnet = document.getElementById('wifiLbl').dataset?.subnet;
+  if(!subnet){
+    const ip = await getLocalIP();
+    if(ip){
+      subnet = ip.split('.').slice(0,3).join('.');
+      document.getElementById('wifiLbl').textContent = ip;
+      document.getElementById('wifiLbl').dataset.subnet = subnet;
     }
-  },2000);
+  }
+  if(!subnet){
+    addLog('No se pudo detectar IP local. Ingresa la IP de tu TV manualmente.','err');
+    showToast('⚠ Ingresa IP manual');
+    btn.classList.remove('spin'); btn.textContent='⟳ ESCANEAR RED';
+    return;
+  }
+
+  addLog(`Escaneando ${subnet}.0/24 (254 IPs)...`, 'cmd');
+  showToast('🔍 ESCANEANDO LAN...');
+  btn.textContent=`⟳ 0%`;
+  scanRunning=true;
+  let found=0;
+
+  await clientScan(subnet,
+    (dev)=>{
+      found++;
+      addLog(`✓ Encontrado: ${dev.name}`,'ok');
+      showToast(`📡 ${dev.label} (${dev.ip})`);
+      addFoundDev(dev);
+    },
+    (pct)=>{
+      btn.textContent=`⟳ ${pct}%`;
+    }
+  );
+
+  scanRunning=false;
+  btn.classList.remove('spin');
+  btn.textContent='⟳ ESCANEAR RED';
+  addLog(`Escaneo completado: ${found} TV(s) encontrado(s)`, found?'ok':'');
+  showToast(found?`✓ ${found} TV(s) encontrado(s)`:'Sin TVs — ingresa IP manual');
 }
 
 async function arpScan(){
-  const btn=document.getElementById('arpBtn');
-  btn.classList.add('spin');btn.textContent='⊕ ESCANEANDO...';
-  addLog('ARP scan rápido de subred...','cmd');
-  try{
-    const r=await fetch('/api/arp_scan');
-    const d=await r.json();
-    addLog(`ARP: ${d.count} host(s) en ${d.subnet}.0/24`,d.count?'ok':'');
-    showToast(d.count?`⊕ ${d.count} encontrado(s)`:'⊕ Sin hosts TV');
-    await loadDevices();
-  }catch(e){addLog('✗ Error ARP scan','err');}
-  btn.classList.remove('spin');btn.textContent='⊕ SCAN RÁPIDO (ARP)';
+  // En cliente, arpScan === scanNow (mismo mecanismo)
+  await scanNow();
 }
 
+// ── PING DIRECTO ──
 async function pingDevice(){
   const ip=document.getElementById('pingIp').value.trim();
   if(!ip){showToast('⚠ Ingresa una IP');return;}
   const el=document.getElementById('pingResult');
-  el.textContent='Probando '+ip+'...';el.style.color='var(--text-dim)';
-  addLog(`Ping directo a ${ip}...`,'cmd');
-  try{
-    const r=await fetch('/api/ping',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
-    const d=await r.json();
-    if(d.reachable){
-      el.textContent=`✓ Alcanzable · Puertos: ${d.open_ports.join(', ')}`;
-      el.style.color='var(--accent2)';
-      addLog(`✓ ${ip} alcanzable — puertos: ${d.open_ports.join(',')}`, 'ok');
-      showToast(`✓ TV en ${ip}`);
-      setTimeout(loadDevices,1000);
-    } else {
-      el.textContent=`✗ Sin respuesta en ${ip}`;
-      el.style.color='var(--accent3)';
-      addLog(`✗ ${ip} no responde`,'err');
-      showToast('✗ IP no responde');
+  el.textContent=`Probando ${ip}...`; el.style.color='var(--text-dim)';
+  addLog(`Probando ${ip}...`,'cmd');
+
+  const open=[];
+  for(const port of TV_PORTS){
+    if(await probePort(ip, port, 800)){
+      open.push(port);
+      break; // basta con uno para confirmar
     }
-  }catch(e){el.textContent='✗ Error de red';el.style.color='var(--accent3)';}
+  }
+  if(open.length){
+    const info=guessBrand(open);
+    const dev={ip, openPorts:open, ...info,
+      name:`${info.label} (${ip})`, paired:false,
+      source:'manual', model:'', manufacturer:'', last_seen:Date.now()};
+    addFoundDev(dev);
+    el.textContent=`✓ ${info.label} — puerto ${open[0]}`;
+    el.style.color='var(--accent2)';
+    addLog(`✓ ${ip} → ${info.label} [:${open[0]}]`,'ok');
+    showToast(`✓ ${info.label}`);
+  } else {
+    el.textContent=`✗ Sin respuesta TV en ${ip}`;
+    el.style.color='var(--accent3)';
+    addLog(`✗ ${ip} no responde en puertos TV`,'err');
+    showToast('✗ Sin TV en esa IP');
+  }
 }
 
+// ── AGREGAR IP MANUAL ──
 async function addManual(){
   const ip=document.getElementById('manualIp').value.trim();
-  if(!ip)return;
-  try{
-    const r=await fetch('/api/add_device',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
-    const d=await r.json();
-    showToast(d.status==='ok'?`✓ ${d.name}`:'⚠ Sin respuesta');
-    addLog(`Manual ${ip}: ${d.name||'desconocido'}`,d.status==='ok'?'ok':'err');
-    setTimeout(loadDevices,800);
-  }catch(e){showToast('⚠ Error');}
+  if(!ip) return;
+  addLog(`Agregando ${ip}...`,'cmd');
+  const open=[];
+  for(const port of TV_PORTS){
+    if(await probePort(ip, port, 900)){ open.push(port); break; }
+  }
+  const info = open.length ? guessBrand(open) : {brand:'unknown',type:'smart_tv',label:'Smart TV'};
+  const dev={ip, openPorts:open, ...info,
+    name:`${info.label} (${ip})`, paired:false,
+    source:'manual', model:'', manufacturer:'', last_seen:Date.now()};
+  addFoundDev(dev);
+  showToast(`✓ ${dev.name}`);
+  addLog(`Manual ${ip}: ${info.label} ${open.length?'[:'+open[0]+']':'(sin puerto)'}`, open.length?'ok':'');
   document.getElementById('manualIp').value='';
 }
 
-// ══════════════════════════
-//  BLUETOOTH — MEJORADO
-// ══════════════════════════
+// ── BLUETOOTH — MEJORADO ──
 let btDevice = null, btServer = null, btChar = null;
 
-// Mapa de comandos a keycodes HID para Android TV / Smart TV
 const BT_HID_MAP = {
   up:0x52, down:0x51, left:0x50, right:0x4F, ok:0x28,
   back:0x29, home:0x4A, menu:0x76,
@@ -1762,17 +1921,15 @@ const BT_HID_MAP = {
 async function connectBluetooth() {
   if(!navigator.bluetooth){
     showToast('⚠ Bluetooth no disponible');
-    addLog('Web Bluetooth API no soportada en este navegador','err');
+    addLog('Web Bluetooth API no soportada','err');
     return;
   }
-  // Si ya hay dispositivo conectado, desconectar
   if(btDevice && btDevice.gatt.connected){
     btDevice.gatt.disconnect();
     btDevice=null; btServer=null; btChar=null;
     document.getElementById('btBtn').textContent='🔵 BLUETOOTH';
     document.getElementById('btBtn').style.color='#6080ff';
-    showToast('🔵 BT desconectado');
-    addLog('Bluetooth desconectado','');
+    showToast('BT desconectado'); addLog('Bluetooth desconectado','');
     return;
   }
   try{
@@ -1780,104 +1937,101 @@ async function connectBluetooth() {
     showToast('🔵 BUSCANDO BT...');
     btDevice = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
-      optionalServices: [
-        'battery_service','device_information',
-        '0000ffe0-0000-1000-8000-00805f9b34fb', // HID genérico
-        '00001812-0000-1000-8000-00805f9b34fb', // HID over GATT
-      ]
+      optionalServices:['battery_service','device_information',
+        '00001812-0000-1000-8000-00805f9b34fb']
     });
     btDevice.addEventListener('gattserverdisconnected', ()=>{
-      btDevice=null;btServer=null;btChar=null;
+      btDevice=null; btServer=null; btChar=null;
       document.getElementById('btBtn').textContent='🔵 BLUETOOTH';
       document.getElementById('btBtn').style.color='#6080ff';
       addLog('BT desconectado','err');
     });
-    // Intentar conectar GATT
     try{
       btServer = await btDevice.gatt.connect();
-      // Intentar servicio HID
       try{
         const svc = await btServer.getPrimaryService('00001812-0000-1000-8000-00805f9b34fb');
         btChar = await svc.getCharacteristic('00002a4d-0000-1000-8000-00805f9b34fb');
-        addLog(`✓ BT HID conectado: ${btDevice.name||'Dispositivo'}`,'ok');
+        addLog(`✓ BT HID: ${btDevice.name||'Dispositivo'}`,'ok');
       }catch(e2){
-        addLog(`BT conectado (sin HID): ${btDevice.name||'Dispositivo'} — comandos por IP`,'ok');
+        addLog(`BT conectado (sin HID): ${btDevice.name||'Dispositivo'}`,'ok');
       }
     }catch(e3){
-      addLog(`BT sin GATT: ${btDevice.name||'Dispositivo'} — usando como referencia`,'ok');
+      addLog(`BT: ${btDevice.name||'Dispositivo'} (GATT no disponible)`,'ok');
     }
-    // Registrar como dispositivo usable
-    const fakeDev={
-      ip:`bt:${btDevice.id||Date.now()}`,
-      name:btDevice.name||'TV Bluetooth',
-      type:'android_tv',brand:'android',
-      paired:true,source:'bluetooth',model:'',manufacturer:'',
-      _btDevice: true
-    };
-    devices.unshift(fakeDev);
-    renderDevices();
+    const fakeDev={ip:`bt:${btDevice.id||Date.now()}`,name:btDevice.name||'TV Bluetooth',
+      type:'android_tv',brand:'android',paired:true,source:'bluetooth',
+      model:'',manufacturer:'',_btDevice:true};
+    addFoundDev(fakeDev);
     selectDev(fakeDev,false);
-    document.getElementById('btBtn').textContent='🔵 BT: '+(btDevice.name||'Conectado').substring(0,12);
+    document.getElementById('btBtn').textContent='🔵 '+(btDevice.name||'Conectado').substring(0,14);
     document.getElementById('btBtn').style.color='var(--accent2)';
     showToast(`🔵 ${btDevice.name||'BT OK'}`);
   }catch(e){
-    if(e.name==='NotFoundError') addLog('BT: Sin dispositivos seleccionados','');
-    else{addLog(`BT Error: ${e.message}`,'err');showToast('⚠ BT: '+e.message.substring(0,30));}
+    if(e.name==='NotFoundError') addLog('BT: Sin selección','');
+    else{addLog(`BT Error: ${e.message}`,'err'); showToast('⚠ BT: '+e.message.substring(0,28));}
   }
 }
 
 async function sendBluetooth(cmd){
-  // Si tenemos característica HID, enviar tecla
   if(btChar){
-    const keycode = BT_HID_MAP[cmd];
+    const keycode=BT_HID_MAP[cmd];
     if(keycode){
       try{
-        // Reporte HID: modifier(0) + reserved(0) + keycode + 5 zeros
-        const report = new Uint8Array([0x00,0x00,keycode,0x00,0x00,0x00,0x00,0x00]);
+        const report=new Uint8Array([0x00,0x00,keycode,0x00,0x00,0x00,0x00,0x00]);
         await btChar.writeValue(report);
-        // Key up
         await btChar.writeValue(new Uint8Array(8));
-        addLog(`BT HID: ${cmd.toUpperCase()} → 0x${keycode.toString(16)}`,'ok');
+        addLog(`BT HID ${cmd} → 0x${keycode.toString(16)}`,'ok');
         return true;
-      }catch(e){addLog(`BT HID error: ${e.message}`,'err');}
+      }catch(e){ addLog(`BT HID error: ${e.message}`,'err'); }
     }
   }
   return false;
 }
 
-// ══════════════════════════
-//  ENVIAR COMANDO
-// ══════════════════════════
+// ── PAIRING ──
+async function connectDev(dev) {
+  if(typeof dev==='string') dev=JSON.parse(dev);
+  selectDev(dev, true);
+}
+async function submitPin() {
+  const pin=document.getElementById('pinInput').value.trim();
+  if(!pin){showToast('⚠ Ingresa el PIN');return;}
+  try{
+    const r=await fetch('/api/submit_pin',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ip:pendingPairIp,pin})});
+    const d=await r.json();
+    closePinModal();
+    if(d.ok){addLog('✓ PIN aceptado','ok');showToast('✓ EMPAREJADO');}
+    else{addLog('✗ PIN incorrecto','err');showToast('✗ PIN incorrecto');}
+  }catch(e){closePinModal();addLog('✗ Error','err');}
+}
+function closePinModal(){document.getElementById('pinModal').classList.remove('show');}
+
+// ── ENVIAR COMANDO ──
 async function send(cmd){
   if(!selDev){showToast('⚠ Selecciona un TV');addLog('Sin TV seleccionado','err');return;}
   const s=JSON.parse(localStorage.getItem('remoteSettings')||'{}');
-  if(s.vibration&&navigator.vibrate)navigator.vibrate(22);
+  if(s.vibration&&navigator.vibrate) navigator.vibrate(22);
   addLog(`→ ${cmd.toUpperCase()}`,'cmd');
 
-  // Dispositivo Bluetooth — intentar HID primero
+  // Bluetooth HID primero
   if(selDev._btDevice || selDev.source==='bluetooth'){
     const btOk = await sendBluetooth(cmd);
     if(btOk){showToast(cmd.toUpperCase());updateStatus(cmd.toUpperCase(),true);return;}
-    // Si falla BT HID, mostrar aviso pero no bloquear
-    addLog('BT HID no disponible — intenta por IP WiFi','err');
-    showToast('⚠ BT sin control — usa IP WiFi');
+    addLog('BT HID no disponible — sin canal de control','err');
+    showToast('⚠ BT: conecta el TV por WiFi para comandos');
     return;
   }
 
-  try{
-    const r=await fetch('/api/command',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ip:selDev.ip,command:cmd,brand:selDev.brand||'unknown',device_type:selDev.type})});
-    const d=await r.json();
-    if(d.status==='ok'){addLog(`✓ [${d.method}]`,'ok');updateStatus(cmd.toUpperCase(),true);}
-    else{addLog(`✗ ${d.message||'Error'}`,'err');updateStatus('Error',false);}
-  }catch(e){addLog('✗ Red','err');}
+  // Envío directo al TV (browser → TV, sin Vercel)
+  const ok = await sendDirectToTV(selDev, cmd);
+  if(ok){ updateStatus(cmd.toUpperCase(),true); }
+  else  { updateStatus('Error',false); }
   showToast(cmd.toUpperCase());
 }
 
-// ══════════════════════════
-//  UI helpers
-// ══════════════════════════
+// ── UI HELPERS ──
 function openDrawer(id){
   closeAll();
   document.getElementById(id).classList.add('open');
@@ -1901,35 +2055,31 @@ function addLog(msg,type=''){
   el.className='le '+type;
   el.innerHTML=`<span class="lt">${t}</span>${msg}`;
   list.prepend(el);
-  while(list.children.length>120)list.removeChild(list.lastChild);
+  while(list.children.length>120) list.removeChild(list.lastChild);
 }
 let toastTimer;
 function showToast(msg){
-  const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
-  clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),1100);
+  const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),1100);
 }
 function applySettings(){
   const s=JSON.parse(localStorage.getItem('remoteSettings')||'{}');
-  if(s.accentColor)document.documentElement.style.setProperty('--accent',s.accentColor);
-  if(s.accentColor2)document.documentElement.style.setProperty('--accent2',s.accentColor2);
-  if(s.scanlines===false)document.body.classList.remove('scanlines');
+  if(s.accentColor) document.documentElement.style.setProperty('--accent',s.accentColor);
+  if(s.accentColor2) document.documentElement.style.setProperty('--accent2',s.accentColor2);
+  if(s.scanlines===false) document.body.classList.remove('scanlines');
 }
 
-// ══════════════════════════
-//  TECLADO
-// ══════════════════════════
+// ── TECLADO ──
 document.addEventListener('keydown',e=>{
   const s=JSON.parse(localStorage.getItem('remoteSettings')||'{}');
-  if(s.keyShortcuts===false||editMode)return;
+  if(s.keyShortcuts===false||editMode) return;
   const map={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',
     Enter:'ok',Backspace:'back',Escape:'home','+':'vol_up','-':'vol_down',
     'm':'mute','p':'play','s':'stop'};
   if(map[e.key]){e.preventDefault();send(map[e.key]);}
 });
 
-// ══════════════════════════
-//  INIT
-// ══════════════════════════
+// ── INIT ──
 applySettings();
 applyAllSizes();
 loadNet();
