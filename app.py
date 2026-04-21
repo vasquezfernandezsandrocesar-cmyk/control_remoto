@@ -945,6 +945,46 @@ def api_pairing_status(ip):
     info = pairing_tokens.get(ip, {"status":"not_paired"})
     return jsonify(info)
 
+@app.route("/api/ping", methods=["POST"])
+def api_ping():
+    ip = (request.json or {}).get("ip","").strip()
+    if not ip:
+        return jsonify({"status":"error","message":"IP requerida"}), 400
+    TV_PORTS = [8001,8002,8060,8061,3000,3001,1925,36669,8008,55000,8080,5555,9080,80]
+    open_ports = []
+    for port in TV_PORTS:
+        if tcp_check(ip, port, timeout=1.0):
+            open_ports.append(port)
+    reachable = len(open_ports) > 0
+    if reachable:
+        register_device(ip, "", "manual_ping")
+        manual_devices[ip] = True
+    return jsonify({"reachable": reachable, "open_ports": open_ports, "ip": ip})
+
+@app.route("/api/arp_scan")
+def api_arp_scan():
+    local_ip, subnet = get_local_subnet()
+    found = []
+    lk = threading.Lock()
+    def check(i):
+        ip = f"{subnet}.{i}"
+        if ip == local_ip: return
+        for port in [8001,8060,3000,80,1925,8080,36669]:
+            if tcp_check(ip, port, 0.4):
+                with lk: found.append({"ip":ip,"port":port})
+                if ip not in discovered_devices:
+                    register_device(ip,"",f"arp:{port}")
+                break
+    threads = []
+    for i in range(1,255):
+        t = threading.Thread(target=check,args=(i,),daemon=True)
+        threads.append(t); t.start()
+        if len(threads)>=60:
+            for th in threads: th.join(timeout=1.0)
+            threads=[]
+    for th in threads: th.join(timeout=1.0)
+    return jsonify({"found":found,"count":len(found),"subnet":subnet})
+
 
 @app.route("/")
 def route_index():
@@ -1099,7 +1139,7 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
   border:1px solid #1c2e44;border-radius:32px;
   box-shadow:0 0 0 1px #08121e,0 24px 64px #00000099,
     inset 0 1px 0 #ffffff07,inset 0 -1px 0 #00000055;
-  min-width:240px;width:260px;
+  min-width:300px;width:320px;
   position:relative;
 }
 .remote::before,.remote::after{content:'';position:absolute;width:32px;height:32px;
@@ -1275,11 +1315,20 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
 <!-- DEVICE DRAWER -->
 <div class="drawer" id="devDrawer">
   <div class="dtitle">DISPOSITIVOS</div>
-  <button class="scan-btn" id="scanBtn" onclick="scanNow()">⟳ ESCANEAR RED</button>
+  <button class="scan-btn" id="scanBtn" onclick="scanNow()">⟳ ESCANEAR RED (SSDP)</button>
+  <button class="scan-btn" id="arpBtn" onclick="arpScan()" style="margin-top:0;background:linear-gradient(135deg,#00ff881a,#00d4ff0d);border-color:var(--accent2);color:var(--accent2);">⊕ SCAN RÁPIDO (ARP)</button>
   <div class="madd">
     <input type="text" id="manualIp" placeholder="192.168.1.x" maxlength="15"/>
     <button onclick="addManual()">+ IP</button>
   </div>
+  <div style="display:flex;gap:5px;margin-bottom:8px;">
+    <input type="text" id="pingIp" placeholder="IP directa TV" maxlength="15"
+      style="flex:1;background:#0a1520;border:1px solid var(--border);color:var(--text);
+        padding:6px 8px;border-radius:6px;font-family:monospace;font-size:.75rem;outline:none;min-width:0;"/>
+    <button onclick="pingDevice()" style="background:#0a1520;border:1px solid var(--accent4);color:var(--accent4);
+      padding:6px 9px;border-radius:6px;cursor:pointer;font-size:.75rem;white-space:nowrap;">🔍 PING</button>
+  </div>
+  <div id="pingResult" style="font-size:.68rem;font-family:monospace;color:var(--text-dim);margin-bottom:6px;min-height:14px;"></div>
   <div class="dlist" id="devList">
     <div class="no-dev"><div class="spinner"></div>Buscando Smart TVs...<br>
       <small style="color:#2a4060;">SSDP · UPnP · Subnet Scan</small></div>
@@ -1319,10 +1368,10 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
 
   <!-- POWER + INPUT -->
   <div class="rrow">
-    <div class="rb pwr" data-cmd="power" data-key="power" style="--bs:52;font-size:1.2rem;border-radius:50%;">⏻</div>
+    <div class="rb pwr" data-cmd="power" data-key="power" style="--bs:64;font-size:1.4rem;border-radius:50%;">⏻</div>
     <div style="display:flex;flex-direction:column;gap:6px;flex:1;margin-left:6px;">
-      <div class="rb" data-cmd="input" data-key="input" style="--bs:38;width:100%;font-size:.65rem;letter-spacing:1px;">INPUT</div>
-      <div class="rb grn" data-cmd="apps" data-key="apps" style="--bs:38;width:100%;font-size:.65rem;letter-spacing:1px;">APPS</div>
+      <div class="rb" data-cmd="input" data-key="input" style="--bs:46;width:100%;font-size:.75rem;letter-spacing:1px;">INPUT</div>
+      <div class="rb grn" data-cmd="apps" data-key="apps" style="--bs:46;width:100%;font-size:.75rem;letter-spacing:1px;">APPS</div>
     </div>
   </div>
 
@@ -1330,21 +1379,21 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
 
   <!-- HOME / BACK / MENU -->
   <div class="rrow">
-    <div class="rb" data-cmd="back" data-key="back" style="--bs:46;">⌫</div>
-    <div class="rb" data-cmd="home" data-key="home" style="--bs:46;">⌂</div>
-    <div class="rb yel" data-cmd="menu" data-key="menu" style="--bs:46;">☰</div>
+    <div class="rb" data-cmd="back" data-key="back" style="--bs:56;font-size:1.1rem;">⌫</div>
+    <div class="rb" data-cmd="home" data-key="home" style="--bs:56;font-size:1.1rem;">⌂</div>
+    <div class="rb yel" data-cmd="menu" data-key="menu" style="--bs:56;font-size:1.1rem;">☰</div>
   </div>
 
   <!-- D-PAD -->
   <div class="dpad">
     <div></div>
-    <div class="rb" data-cmd="up"    data-key="up"    style="--bs:50;border-radius:10px 10px 4px 4px;">▲</div>
+    <div class="rb" data-cmd="up"    data-key="up"    style="--bs:62;border-radius:10px 10px 4px 4px;font-size:1.1rem;">▲</div>
     <div></div>
-    <div class="rb" data-cmd="left"  data-key="left"  style="--bs:50;border-radius:10px 4px 4px 10px;">◀</div>
-    <div class="rb ok" data-cmd="ok" data-key="ok"    style="--bs:54;">OK</div>
-    <div class="rb" data-cmd="right" data-key="right" style="--bs:50;border-radius:4px 10px 10px 4px;">▶</div>
+    <div class="rb" data-cmd="left"  data-key="left"  style="--bs:62;border-radius:10px 4px 4px 10px;font-size:1.1rem;">◀</div>
+    <div class="rb ok" data-cmd="ok" data-key="ok"    style="--bs:68;font-size:1rem;">OK</div>
+    <div class="rb" data-cmd="right" data-key="right" style="--bs:62;border-radius:4px 10px 10px 4px;font-size:1.1rem;">▶</div>
     <div></div>
-    <div class="rb" data-cmd="down"  data-key="down"  style="--bs:50;border-radius:4px 4px 10px 10px;">▼</div>
+    <div class="rb" data-cmd="down"  data-key="down"  style="--bs:62;border-radius:4px 4px 10px 10px;font-size:1.1rem;">▼</div>
     <div></div>
   </div>
 
@@ -1352,11 +1401,11 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
 
   <!-- MEDIA -->
   <div class="rrow">
-    <div class="rb" data-cmd="prev"   data-key="prev"   style="--bs:42;font-size:1rem;">⏮</div>
-    <div class="rb" data-cmd="rewind" data-key="rewind" style="--bs:42;font-size:1rem;">⏪</div>
-    <div class="rb grn" data-cmd="play" data-key="play" style="--bs:48;font-size:1rem;">⏯</div>
-    <div class="rb" data-cmd="fwd"    data-key="fwd"    style="--bs:42;font-size:1rem;">⏩</div>
-    <div class="rb red" data-cmd="stop" data-key="stop" style="--bs:42;font-size:1rem;">⏹</div>
+    <div class="rb" data-cmd="prev"   data-key="prev"   style="--bs:52;font-size:1.1rem;">⏮</div>
+    <div class="rb" data-cmd="rewind" data-key="rewind" style="--bs:52;font-size:1.1rem;">⏪</div>
+    <div class="rb grn" data-cmd="play" data-key="play" style="--bs:60;font-size:1.2rem;">⏯</div>
+    <div class="rb" data-cmd="fwd"    data-key="fwd"    style="--bs:52;font-size:1.1rem;">⏩</div>
+    <div class="rb red" data-cmd="stop" data-key="stop" style="--bs:52;font-size:1.1rem;">⏹</div>
   </div>
 
   <div class="rdiv"></div>
@@ -1365,20 +1414,20 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
   <div class="rrow" style="gap:12px;">
     <div class="rcol">
       <div style="font-size:.52rem;letter-spacing:2px;color:var(--text-dim);font-family:'Orbitron',monospace;">VOL</div>
-      <div class="rb" data-cmd="vol_up"   data-key="vol_up"   style="--bs:46;">＋</div>
-      <div class="rb" data-cmd="mute"     data-key="mute"     style="--bs:40;font-size:.8rem;">🔇</div>
-      <div class="rb" data-cmd="vol_down" data-key="vol_down" style="--bs:46;">－</div>
+      <div class="rb" data-cmd="vol_up"   data-key="vol_up"   style="--bs:56;font-size:1.1rem;">＋</div>
+      <div class="rb" data-cmd="mute"     data-key="mute"     style="--bs:50;font-size:1rem;">🔇</div>
+      <div class="rb" data-cmd="vol_down" data-key="vol_down" style="--bs:56;font-size:1.1rem;">－</div>
     </div>
     <div class="rcol">
-      <div class="rb grn"  data-cmd="info"     data-key="info"     style="--bs:42;font-size:.75rem;">ℹ</div>
-      <div class="rb yel"  data-cmd="subtitle" data-key="subtitle" style="--bs:42;font-size:.65rem;">SUB</div>
-      <div class="rb"      data-cmd="sleep"    data-key="sleep"    style="--bs:42;font-size:.58rem;letter-spacing:.5px;">SLP</div>
+      <div class="rb grn"  data-cmd="info"     data-key="info"     style="--bs:52;font-size:.85rem;">ℹ</div>
+      <div class="rb yel"  data-cmd="subtitle" data-key="subtitle" style="--bs:52;font-size:.75rem;">SUB</div>
+      <div class="rb"      data-cmd="sleep"    data-key="sleep"    style="--bs:52;font-size:.68rem;letter-spacing:.5px;">SLP</div>
     </div>
     <div class="rcol">
       <div style="font-size:.52rem;letter-spacing:2px;color:var(--text-dim);font-family:'Orbitron',monospace;">CH</div>
-      <div class="rb" data-cmd="ch_up"   data-key="ch_up"   style="--bs:46;">＋</div>
-      <div class="rb" data-cmd="aspect"  data-key="aspect"  style="--bs:40;font-size:.6rem;">ASP</div>
-      <div class="rb" data-cmd="ch_down" data-key="ch_down" style="--bs:46;">－</div>
+      <div class="rb" data-cmd="ch_up"   data-key="ch_up"   style="--bs:56;font-size:1.1rem;">＋</div>
+      <div class="rb" data-cmd="aspect"  data-key="aspect"  style="--bs:50;font-size:.7rem;">ASP</div>
+      <div class="rb" data-cmd="ch_down" data-key="ch_down" style="--bs:56;font-size:1.1rem;">－</div>
     </div>
   </div>
 
@@ -1386,32 +1435,32 @@ body.scanlines::after{content:'';position:fixed;inset:0;pointer-events:none;z-in
 
   <!-- COLORES -->
   <div class="rrow" style="gap:6px;">
-    <div class="rb cred" data-cmd="red"    data-key="red"    style="--bs:36;flex:1;width:auto;font-size:.58rem;">RED</div>
-    <div class="rb cgrn" data-cmd="green"  data-key="green"  style="--bs:36;flex:1;width:auto;font-size:.58rem;">GRN</div>
-    <div class="rb cyel" data-cmd="yellow" data-key="yellow" style="--bs:36;flex:1;width:auto;font-size:.58rem;">YEL</div>
-    <div class="rb cblu" data-cmd="blue"   data-key="blue"   style="--bs:36;flex:1;width:auto;font-size:.58rem;">BLU</div>
+    <div class="rb cred" data-cmd="red"    data-key="red"    style="--bs:44;flex:1;width:auto;font-size:.68rem;">RED</div>
+    <div class="rb cgrn" data-cmd="green"  data-key="green"  style="--bs:44;flex:1;width:auto;font-size:.68rem;">GRN</div>
+    <div class="rb cyel" data-cmd="yellow" data-key="yellow" style="--bs:44;flex:1;width:auto;font-size:.68rem;">YEL</div>
+    <div class="rb cblu" data-cmd="blue"   data-key="blue"   style="--bs:44;flex:1;width:auto;font-size:.68rem;">BLU</div>
   </div>
 
   <!-- NUMPAD -->
   <div class="npad">
-    <div class="rb num" data-cmd="1" data-key="n1" style="--bs:42;">1</div>
-    <div class="rb num" data-cmd="2" data-key="n2" style="--bs:42;">2</div>
-    <div class="rb num" data-cmd="3" data-key="n3" style="--bs:42;">3</div>
-    <div class="rb num" data-cmd="4" data-key="n4" style="--bs:42;">4</div>
-    <div class="rb num" data-cmd="5" data-key="n5" style="--bs:42;">5</div>
-    <div class="rb num" data-cmd="6" data-key="n6" style="--bs:42;">6</div>
-    <div class="rb num" data-cmd="7" data-key="n7" style="--bs:42;">7</div>
-    <div class="rb num" data-cmd="8" data-key="n8" style="--bs:42;">8</div>
-    <div class="rb num" data-cmd="9" data-key="n9" style="--bs:42;">9</div>
-    <div class="rb yel"              data-cmd="*"  data-key="nstar" style="--bs:42;font-size:.9rem;">✳</div>
-    <div class="rb num" data-cmd="0" data-key="n0" style="--bs:42;">0</div>
-    <div class="rb red"              data-cmd="#"  data-key="nhash" style="--bs:42;font-size:.85rem;">🔙</div>
+    <div class="rb num" data-cmd="1" data-key="n1" style="--bs:52;font-size:1rem;">1</div>
+    <div class="rb num" data-cmd="2" data-key="n2" style="--bs:52;font-size:1rem;">2</div>
+    <div class="rb num" data-cmd="3" data-key="n3" style="--bs:52;font-size:1rem;">3</div>
+    <div class="rb num" data-cmd="4" data-key="n4" style="--bs:52;font-size:1rem;">4</div>
+    <div class="rb num" data-cmd="5" data-key="n5" style="--bs:52;font-size:1rem;">5</div>
+    <div class="rb num" data-cmd="6" data-key="n6" style="--bs:52;font-size:1rem;">6</div>
+    <div class="rb num" data-cmd="7" data-key="n7" style="--bs:52;font-size:1rem;">7</div>
+    <div class="rb num" data-cmd="8" data-key="n8" style="--bs:52;font-size:1rem;">8</div>
+    <div class="rb num" data-cmd="9" data-key="n9" style="--bs:52;font-size:1rem;">9</div>
+    <div class="rb yel"              data-cmd="*"  data-key="nstar" style="--bs:52;font-size:1rem;">✳</div>
+    <div class="rb num" data-cmd="0" data-key="n0" style="--bs:52;font-size:1rem;">0</div>
+    <div class="rb red"              data-cmd="#"  data-key="nhash" style="--bs:52;font-size:1rem;">🔙</div>
   </div>
 
   <!-- BT button -->
   <div class="rdiv"></div>
   <div class="rrow">
-    <div class="rb" id="btBtn" onclick="connectBluetooth()" style="--bs:38;flex:1;width:auto;font-size:.62rem;letter-spacing:1px;color:#6080ff;border-color:#2030a0;">🔵 BLUETOOTH</div>
+    <div class="rb" id="btBtn" onclick="connectBluetooth()" style="--bs:46;flex:1;width:auto;font-size:.72rem;letter-spacing:1px;color:#6080ff;border-color:#2030a0;">🔵 BLUETOOTH</div>
   </div>
 
 </div><!-- /remote -->
@@ -1625,14 +1674,59 @@ function closePinModal(){document.getElementById('pinModal').classList.remove('s
 
 async function scanNow(){
   const btn=document.getElementById('scanBtn');
-  btn.classList.add('spin');btn.textContent='⟳ ESCANEANDO...';
+  btn.classList.add('spin');btn.textContent='⟳ ESCANEANDO SSDP...';
   addLog('Iniciando SSDP + subnet scan...','cmd');
   try{await fetch('/api/scan',{method:'POST'});}catch(e){}
-  setTimeout(async()=>{
+  // Recargar en ciclos cortos para mostrar resultados progresivos
+  let waited=0;
+  const iv=setInterval(async()=>{
+    waited+=2000;
     await loadDevices();
-    btn.classList.remove('spin');btn.textContent='⟳ ESCANEAR RED';
-    addLog(`Encontrados: ${devices.length} disp.`,devices.length?'ok':'');
-  },9000);
+    if(waited>=10000){
+      clearInterval(iv);
+      btn.classList.remove('spin');btn.textContent='⟳ ESCANEAR RED (SSDP)';
+      addLog(`Encontrados: ${devices.length} disp.`,devices.length?'ok':'');
+    }
+  },2000);
+}
+
+async function arpScan(){
+  const btn=document.getElementById('arpBtn');
+  btn.classList.add('spin');btn.textContent='⊕ ESCANEANDO...';
+  addLog('ARP scan rápido de subred...','cmd');
+  try{
+    const r=await fetch('/api/arp_scan');
+    const d=await r.json();
+    addLog(`ARP: ${d.count} host(s) en ${d.subnet}.0/24`,d.count?'ok':'');
+    showToast(d.count?`⊕ ${d.count} encontrado(s)`:'⊕ Sin hosts TV');
+    await loadDevices();
+  }catch(e){addLog('✗ Error ARP scan','err');}
+  btn.classList.remove('spin');btn.textContent='⊕ SCAN RÁPIDO (ARP)';
+}
+
+async function pingDevice(){
+  const ip=document.getElementById('pingIp').value.trim();
+  if(!ip){showToast('⚠ Ingresa una IP');return;}
+  const el=document.getElementById('pingResult');
+  el.textContent='Probando '+ip+'...';el.style.color='var(--text-dim)';
+  addLog(`Ping directo a ${ip}...`,'cmd');
+  try{
+    const r=await fetch('/api/ping',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+    const d=await r.json();
+    if(d.reachable){
+      el.textContent=`✓ Alcanzable · Puertos: ${d.open_ports.join(', ')}`;
+      el.style.color='var(--accent2)';
+      addLog(`✓ ${ip} alcanzable — puertos: ${d.open_ports.join(',')}`, 'ok');
+      showToast(`✓ TV en ${ip}`);
+      setTimeout(loadDevices,1000);
+    } else {
+      el.textContent=`✗ Sin respuesta en ${ip}`;
+      el.style.color='var(--accent3)';
+      addLog(`✗ ${ip} no responde`,'err');
+      showToast('✗ IP no responde');
+    }
+  }catch(e){el.textContent='✗ Error de red';el.style.color='var(--accent3)';}
 }
 
 async function addManual(){
@@ -1650,33 +1744,105 @@ async function addManual(){
 }
 
 // ══════════════════════════
-//  BLUETOOTH
+//  BLUETOOTH — MEJORADO
 // ══════════════════════════
+let btDevice = null, btServer = null, btChar = null;
+
+// Mapa de comandos a keycodes HID para Android TV / Smart TV
+const BT_HID_MAP = {
+  up:0x52, down:0x51, left:0x50, right:0x4F, ok:0x28,
+  back:0x29, home:0x4A, menu:0x76,
+  vol_up:0x80, vol_down:0x81, mute:0x7F,
+  play:0xE0, pause:0xE0, stop:0xE1,
+  fwd:0xE3, rewind:0xE4,
+  '0':0x27,'1':0x1E,'2':0x1F,'3':0x20,'4':0x21,'5':0x22,
+  '6':0x23,'7':0x24,'8':0x25,'9':0x26,
+};
+
 async function connectBluetooth() {
   if(!navigator.bluetooth){
-    showToast('⚠ Bluetooth no disponible en este navegador');
-    addLog('Web Bluetooth API no disponible','err');
+    showToast('⚠ Bluetooth no disponible');
+    addLog('Web Bluetooth API no soportada en este navegador','err');
+    return;
+  }
+  // Si ya hay dispositivo conectado, desconectar
+  if(btDevice && btDevice.gatt.connected){
+    btDevice.gatt.disconnect();
+    btDevice=null; btServer=null; btChar=null;
+    document.getElementById('btBtn').textContent='🔵 BLUETOOTH';
+    document.getElementById('btBtn').style.color='#6080ff';
+    showToast('🔵 BT desconectado');
+    addLog('Bluetooth desconectado','');
     return;
   }
   try{
     addLog('Buscando dispositivos Bluetooth...','cmd');
     showToast('🔵 BUSCANDO BT...');
-    const device = await navigator.bluetooth.requestDevice({
+    btDevice = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
-      optionalServices: ['battery_service','device_information']
+      optionalServices: [
+        'battery_service','device_information',
+        '0000ffe0-0000-1000-8000-00805f9b34fb', // HID genérico
+        '00001812-0000-1000-8000-00805f9b34fb', // HID over GATT
+      ]
     });
-    addLog(`BT: ${device.name||'Dispositivo'} conectado`,'ok');
-    showToast(`🔵 ${device.name||'BT OK'}`);
-    // Añadir como dispositivo manual con IP ficticia BT
-    const fakeDev={ip:`bt:${device.id||Date.now()}`,name:device.name||'Dispositivo BT',
-      type:'android_tv',brand:'android',paired:true,source:'bluetooth',model:'',manufacturer:''};
+    btDevice.addEventListener('gattserverdisconnected', ()=>{
+      btDevice=null;btServer=null;btChar=null;
+      document.getElementById('btBtn').textContent='🔵 BLUETOOTH';
+      document.getElementById('btBtn').style.color='#6080ff';
+      addLog('BT desconectado','err');
+    });
+    // Intentar conectar GATT
+    try{
+      btServer = await btDevice.gatt.connect();
+      // Intentar servicio HID
+      try{
+        const svc = await btServer.getPrimaryService('00001812-0000-1000-8000-00805f9b34fb');
+        btChar = await svc.getCharacteristic('00002a4d-0000-1000-8000-00805f9b34fb');
+        addLog(`✓ BT HID conectado: ${btDevice.name||'Dispositivo'}`,'ok');
+      }catch(e2){
+        addLog(`BT conectado (sin HID): ${btDevice.name||'Dispositivo'} — comandos por IP`,'ok');
+      }
+    }catch(e3){
+      addLog(`BT sin GATT: ${btDevice.name||'Dispositivo'} — usando como referencia`,'ok');
+    }
+    // Registrar como dispositivo usable
+    const fakeDev={
+      ip:`bt:${btDevice.id||Date.now()}`,
+      name:btDevice.name||'TV Bluetooth',
+      type:'android_tv',brand:'android',
+      paired:true,source:'bluetooth',model:'',manufacturer:'',
+      _btDevice: true
+    };
     devices.unshift(fakeDev);
     renderDevices();
     selectDev(fakeDev,false);
+    document.getElementById('btBtn').textContent='🔵 BT: '+(btDevice.name||'Conectado').substring(0,12);
+    document.getElementById('btBtn').style.color='var(--accent2)';
+    showToast(`🔵 ${btDevice.name||'BT OK'}`);
   }catch(e){
-    if(e.name==='NotFoundError')addLog('BT: Sin dispositivos seleccionados','');
+    if(e.name==='NotFoundError') addLog('BT: Sin dispositivos seleccionados','');
     else{addLog(`BT Error: ${e.message}`,'err');showToast('⚠ BT: '+e.message.substring(0,30));}
   }
+}
+
+async function sendBluetooth(cmd){
+  // Si tenemos característica HID, enviar tecla
+  if(btChar){
+    const keycode = BT_HID_MAP[cmd];
+    if(keycode){
+      try{
+        // Reporte HID: modifier(0) + reserved(0) + keycode + 5 zeros
+        const report = new Uint8Array([0x00,0x00,keycode,0x00,0x00,0x00,0x00,0x00]);
+        await btChar.writeValue(report);
+        // Key up
+        await btChar.writeValue(new Uint8Array(8));
+        addLog(`BT HID: ${cmd.toUpperCase()} → 0x${keycode.toString(16)}`,'ok');
+        return true;
+      }catch(e){addLog(`BT HID error: ${e.message}`,'err');}
+    }
+  }
+  return false;
 }
 
 // ══════════════════════════
@@ -1687,6 +1853,17 @@ async function send(cmd){
   const s=JSON.parse(localStorage.getItem('remoteSettings')||'{}');
   if(s.vibration&&navigator.vibrate)navigator.vibrate(22);
   addLog(`→ ${cmd.toUpperCase()}`,'cmd');
+
+  // Dispositivo Bluetooth — intentar HID primero
+  if(selDev._btDevice || selDev.source==='bluetooth'){
+    const btOk = await sendBluetooth(cmd);
+    if(btOk){showToast(cmd.toUpperCase());updateStatus(cmd.toUpperCase(),true);return;}
+    // Si falla BT HID, mostrar aviso pero no bloquear
+    addLog('BT HID no disponible — intenta por IP WiFi','err');
+    showToast('⚠ BT sin control — usa IP WiFi');
+    return;
+  }
+
   try{
     const r=await fetch('/api/command',{method:'POST',
       headers:{'Content-Type':'application/json'},
